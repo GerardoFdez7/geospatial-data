@@ -8,8 +8,12 @@ Avance reproducible del análisis de cianobacteria en los lagos Atitlán y Amati
 - consulta de las 22 fechas oficiales mediante una API STAC de Sentinel-2;
 - lectura por rangos de solo `B03`, `B04`, `B05`, `B08` y `SCL` (sin escenas completas);
 - GeoTIFF multibanda por lago/fecha con clorofila-a proxy de cianobacteria, NDCI, NDVI y NDWI;
-- CSV con promedios, cobertura válida y estadísticos robustos;
-- gráfico temporal, fechas críticas, mapas de comprobación e informe PDF dirigido a ambientalistas.
+- CSV con promedios, cobertura válida, estadísticos robustos y % de extensión de floración (niveles guía OMS);
+- gráfico temporal, fechas críticas, mapas comparativos entre fechas y mapas interactivos (folium) por lago;
+- correlación de píxeles (Pearson) entre el proxy de cianobacteria y NDVI/NDWI, por lago;
+- análisis exploratorio: zonas de acumulación persistente, distribución por fecha (boxplots) y patrón estacional (seca/lluviosa);
+- comparación explícita de intensidad y frecuencia de floración entre ambos lagos;
+- informe PDF único dirigido a ambientalistas con todos los resultados anteriores.
 
 La adquisición ejecutada usa el espejo público Sentinel-2 L2A de Microsoft Planetary Computer para no requerir secretos. El script también verifica el backend oficial openEO de Copernicus y permite autenticarlo por OIDC. Ambos accesos consultan productos Sentinel-2; el origen y los identificadores exactos quedan registrados en `outputs/metadata/catalogo_escenas.csv`.
 
@@ -44,3 +48,13 @@ La primera ejecución descarga únicamente ventanas espaciales de las cinco band
 
 La clorofila-a es un **proxy de floración compatible con cianobacteria**, no un conteo directo de células ni una medición de toxinas. Las fechas críticas requieren confirmación con muestreo de campo.
 El algoritmo publicado fue calibrado originalmente para Sentinel-2 L1C; aquí se aplica de forma explícita a reflectancia L2A, como solicita el laboratorio. Esa adaptación mejora la corrección atmosférica operativa, pero no sustituye una calibración local para los lagos guatemaltecos.
+
+La extensión de floración (Ejercicio 8.1) usa los niveles guía de la OMS para clorofila-a asociada a cianobacteria: alerta moderada ≥10 mg/m³, alerta alta ≥50 mg/m³.
+
+## Salidas
+
+- `outputs/informe_lagos_cianobacteria.pdf`: informe completo dirigido a ambientalistas (ejercicios 1–8).
+- `outputs/resumen_temporal.csv`: tabla con todos los estadísticos por lago/fecha.
+- `outputs/rasters/<lago>/`: GeoTIFF de índices por fecha y máscara del lago.
+- `outputs/mapas_interactivos/<lago>.html`: mapa interactivo (folium) navegable con el proxy de cianobacteria.
+- `outputs/metadata/`: catálogo de escenas usadas, verificación de conexión openEO y validación de entrega.
