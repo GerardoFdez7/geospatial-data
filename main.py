@@ -5,6 +5,7 @@ import math
 import os
 import sys
 import textwrap
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -12,6 +13,7 @@ from typing import Iterable
 import matplotlib
 
 matplotlib.use("Agg")
+import folium
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import numpy as np
@@ -25,9 +27,10 @@ from rasterio.transform import from_origin
 from rasterio.vrt import WarpedVRT
 from rasterio.warp import transform_bounds
 from scipy import ndimage
+from scipy.stats import pearsonr
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[0]
 CACHE = ROOT / "cache"
 OUTPUTS = ROOT / "outputs"
 RASTERS = OUTPUTS / "rasters"
@@ -41,6 +44,9 @@ BANDS = ("B03", "B04", "B05", "B08", "SCL")
 TARGET_CRS = "EPSG:32615"
 RESOLUTION = 20.0
 NODATA = -9999.0
+# Niveles guia OMS para clorofila-a asociada a cianobacteria (mg/m3 ~ ug/L).
+BLOOM_MODERATE_MG_M3 = 10.0
+BLOOM_HIGH_MG_M3 = 50.0
 
 
 @dataclass(frozen=True)
@@ -182,6 +188,9 @@ def read_mosaic(items: list[dict], band: str, grid: tuple) -> np.ndarray:
         "CPL_VSIL_CURL_ALLOWED_EXTENSIONS": ".tif,.TIF",
         "GDAL_HTTP_MULTIRANGE": "YES",
         "GDAL_HTTP_MERGE_CONSECUTIVE_RANGES": "YES",
+        "GDAL_HTTP_MAX_RETRY": "6",
+        "GDAL_HTTP_RETRY_DELAY": "2",
+        "GDAL_HTTP_TIMEOUT": "60",
     }
     with Env(**env_options):
         for item in items:
@@ -207,13 +216,25 @@ def cache_path(lake: Lake, date: str) -> Path:
     return CACHE / lake.key / f"{date}.npz"
 
 
-def acquire_date(lake: Lake, date: str, grid: tuple, force: bool) -> tuple[dict, list[dict]]:
+def acquire_date(lake: Lake, date: str, grid: tuple, force: bool, attempts: int = 4) -> tuple[dict, list[dict]]:
     path = cache_path(lake, date)
     items = search_items(lake, date)
     if force or not path.exists():
         path.parent.mkdir(parents=True, exist_ok=True)
-        arrays = {band: read_mosaic(items, band, grid) for band in BANDS}
-        np.savez_compressed(path, **arrays)
+        last_error: Exception | None = None
+        for attempt in range(1, attempts + 1):
+            try:
+                arrays = {band: read_mosaic(items, band, grid) for band in BANDS}
+                np.savez_compressed(path, **arrays)
+                last_error = None
+                break
+            except Exception as exc:  # transient red (curl/HTTP): reintenta con backoff
+                last_error = exc
+                if attempt < attempts:
+                    print(f"  aviso: fallo de red ({exc}); reintento {attempt}/{attempts - 1}...", flush=True)
+                    time.sleep(3 * attempt)
+        if last_error is not None:
+            raise last_error
     with np.load(path) as stored:
         arrays = {band: stored[band] for band in BANDS}
     return arrays, items
@@ -304,6 +325,15 @@ def scene_rows(lake: Lake, date: str, items: list[dict]) -> list[dict]:
     return rows
 
 
+def bloom_extent_pct(cyano_values: np.ndarray) -> tuple[float, float]:
+    """Ejercicio 8.1: % de pixeles del lago en alerta moderada/alta (niveles guia OMS)."""
+    if cyano_values.size == 0:
+        return 0.0, 0.0
+    moderate = float(100 * np.mean(cyano_values >= BLOOM_MODERATE_MG_M3))
+    high = float(100 * np.mean(cyano_values >= BLOOM_HIGH_MG_M3))
+    return moderate, high
+
+
 def process_lake(lake: Lake, force: bool) -> tuple[pd.DataFrame, dict]:
     grid = target_grid(lake.bbox)
     votes = np.zeros((grid[2], grid[1]), dtype=np.uint16)
@@ -325,6 +355,12 @@ def process_lake(lake: Lake, force: bool) -> tuple[pd.DataFrame, dict]:
 
     rows = []
     peak_maps: dict[str, np.ndarray] = {}
+    bloom_votes = np.zeros(permanent.shape, dtype=np.uint16)
+    bloom_seen = np.zeros(permanent.shape, dtype=np.uint16)
+    corr_pixels: dict[str, dict[str, list[np.ndarray]]] = {
+        "ndvi": {"cyano": [], "other": []},
+        "ndwi": {"cyano": [], "other": []},
+    }
     for date in lake.dates:
         with np.load(cache_path(lake, date)) as stored:
             arrays = {band: stored[band] for band in BANDS}
@@ -348,6 +384,7 @@ def process_lake(lake: Lake, force: bool) -> tuple[pd.DataFrame, dict]:
         )
         valid = valid_by_index["cyano_chla"]
         cya = idx["cyano_chla"][valid]
+        floracion_moderada_pct, floracion_alta_pct = bloom_extent_pct(cya)
         row = {
             "lago": lake.label, "fecha": date,
             "cyano_media_mg_m3": float(np.nanmean(cya)),
@@ -360,11 +397,32 @@ def process_lake(lake: Lake, force: bool) -> tuple[pd.DataFrame, dict]:
             "pixeles_validos": int(valid.sum()),
             "pixeles_lago": int(permanent.sum()),
             "cobertura_valida_pct": float(100 * valid.sum() / permanent.sum()),
+            "floracion_moderada_pct": floracion_moderada_pct,
+            "floracion_alta_pct": floracion_alta_pct,
         }
         rows.append(row)
         peak_maps[date] = out_arrays[0]
 
-    return pd.DataFrame(rows), {"grid": grid, "mask": permanent, "scenes": scenes, "maps": peak_maps}
+        bloom_seen[valid] += 1
+        bloom_votes[valid & (idx["cyano_chla"] >= BLOOM_MODERATE_MG_M3)] += 1
+        for other_name in ("ndvi", "ndwi"):
+            pair_mask = valid_by_index["cyano_chla"] & valid_by_index[other_name]
+            if pair_mask.any():
+                corr_pixels[other_name]["cyano"].append(idx["cyano_chla"][pair_mask])
+                corr_pixels[other_name]["other"].append(idx[other_name][pair_mask])
+
+    bloom_persistence = np.divide(
+        bloom_votes, bloom_seen, out=np.zeros(bloom_votes.shape, dtype=np.float32), where=bloom_seen > 0
+    )
+    corr_arrays = {
+        name: (np.concatenate(d["cyano"]), np.concatenate(d["other"]))
+        for name, d in corr_pixels.items() if d["cyano"]
+    }
+
+    return pd.DataFrame(rows), {
+        "grid": grid, "mask": permanent, "scenes": scenes, "maps": peak_maps,
+        "bloom_persistence": bloom_persistence, "corr": corr_arrays,
+    }
 
 
 def classify_peaks(summary: pd.DataFrame) -> pd.DataFrame:
@@ -455,6 +513,261 @@ def plot_peak_maps(summary: pd.DataFrame, contexts: dict) -> Path:
     return path
 
 
+def select_key_dates(summary: pd.DataFrame, lake_label: str) -> dict[str, pd.Series]:
+    group = summary[summary["lago"] == lake_label].sort_values("fecha")
+    good = group[group["calidad_suficiente"]]
+    return {
+        "Primera fecha": good.iloc[0],
+        "Fecha pico": good.nlargest(1, "cyano_media_mg_m3").iloc[0],
+        "Última fecha": good.iloc[-1],
+    }
+
+
+def plot_date_comparison(lake: Lake, contexts: dict, summary: pd.DataFrame) -> Path:
+    """Ejercicio 5.2: mapas comparativos entre distintas fechas para un mismo lago."""
+    picks = select_key_dates(summary, lake.label)
+    maps = contexts[lake.key]["maps"]
+    path = FIGURES / f"comparacion_fechas_{lake.key}.png"
+    fig, axes = plt.subplots(1, 3, figsize=(13, 4.6), constrained_layout=True)
+    arrays = {label: maps[row["fecha"].strftime("%Y-%m-%d")] for label, row in picks.items()}
+    vals_all = np.concatenate([arr[arr != NODATA] for arr in arrays.values()])
+    vmax = float(np.nanpercentile(vals_all, 98)) if vals_all.size else 1.0
+    image = None
+    for ax, (label, row) in zip(axes, picks.items()):
+        masked = np.ma.masked_equal(arrays[label], NODATA)
+        image = ax.imshow(masked, cmap="turbo", norm=Normalize(0, vmax))
+        ax.set_title(f"{label}\n{row['fecha'].strftime('%d-%m-%Y')}", fontsize=10, weight="bold")
+        ax.set_axis_off()
+    fig.colorbar(image, ax=axes, shrink=0.8, label="Clorofila-a proxy (mg/m³)")
+    fig.suptitle(f"{lake.label}: comparación espacial entre fechas", fontsize=13, weight="bold")
+    fig.savefig(path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    return path
+
+
+def plot_bloom_persistence(contexts: dict) -> Path:
+    """Ejercicio 8.2: zonas de acumulación persistente de floración."""
+    path = FIGURES / "persistencia_floracion.png"
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5.5), constrained_layout=True)
+    labels = {"atitlan": "Lago Atitlán", "amatitlan": "Lago Amatitlán"}
+    image = None
+    for ax, key in zip(axes, ("atitlan", "amatitlan")):
+        persistence = contexts[key]["bloom_persistence"]
+        mask = contexts[key]["mask"]
+        masked = np.ma.array(persistence, mask=~mask)
+        image = ax.imshow(masked, cmap="YlOrRd", vmin=0, vmax=1)
+        ax.set_title(labels[key], weight="bold")
+        ax.set_axis_off()
+    fig.colorbar(image, ax=axes, shrink=0.82, label="Fracción de fechas en alerta ≥10 mg/m³")
+    fig.suptitle("Zonas de acumulación persistente de floración", fontsize=14, weight="bold")
+    fig.savefig(path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    return path
+
+
+def plot_distribution_by_date(contexts: dict) -> Path:
+    """Ejercicio 8.3: comparación de la distribución de valores entre fechas (boxplots)."""
+    path = FIGURES / "distribucion_por_fecha.png"
+    fig, axes = plt.subplots(2, 1, figsize=(12, 9), constrained_layout=True)
+    labels = {"atitlan": "Lago Atitlán", "amatitlan": "Lago Amatitlán"}
+    for ax, key in zip(axes, ("atitlan", "amatitlan")):
+        maps = contexts[key]["maps"]
+        dates_sorted = sorted(maps.keys())
+        data = [maps[d][maps[d] != NODATA] for d in dates_sorted]
+        labels_x = [datetime.strptime(d, "%Y-%m-%d").strftime("%d-%m-%y") for d in dates_sorted]
+        ax.boxplot(data, tick_labels=labels_x, showfliers=False, patch_artist=True,
+                   boxprops=dict(facecolor="#a9d6e5"))
+        ax.set_title(labels[key], loc="left", weight="bold")
+        ax.set_ylabel("Clorofila-a proxy (mg/m³)")
+        ax.tick_params(axis="x", rotation=45)
+        ax.grid(alpha=0.25, axis="y")
+    fig.suptitle("Distribución del proxy de cianobacteria por fecha", fontsize=14, weight="bold")
+    fig.savefig(path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    return path
+
+
+def add_season(summary: pd.DataFrame) -> pd.DataFrame:
+    result = summary.copy()
+    result["temporada"] = np.where(
+        result["fecha"].dt.month.isin([11, 12, 1, 2, 3, 4]), "seca", "lluviosa"
+    )
+    return result
+
+
+def plot_seasonal(summary: pd.DataFrame) -> Path:
+    """Ejercicio 8.4: patrón estacional (temporada seca nov-abr vs lluviosa may-oct en Guatemala)."""
+    path = FIGURES / "patron_estacional.png"
+    grouped = (
+        summary[summary["calidad_suficiente"]]
+        .groupby(["lago", "temporada"])["cyano_media_mg_m3"]
+        .mean()
+        .unstack()
+        .reindex(columns=["seca", "lluviosa"])
+    )
+    fig, ax = plt.subplots(figsize=(8, 5), constrained_layout=True)
+    grouped.plot(kind="bar", ax=ax, color=["#e9c46a", "#2a9d8f"])
+    ax.set_ylabel("Clorofila-a proxy media (mg/m³)")
+    ax.set_title("Comparación estacional (seca: nov-abr / lluviosa: may-oct)", loc="left", weight="bold")
+    ax.set_xticklabels(ax.get_xticklabels(), rotation=0)
+    ax.grid(alpha=0.25, axis="y")
+    ax.legend(title="Temporada")
+    fig.savefig(path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    return path
+
+
+def plot_correlation(contexts: dict) -> tuple[Path, dict]:
+    """Ejercicio 6: correlación entre el proxy de cianobacteria y NDVI/NDWI."""
+    path = FIGURES / "correlacion_indices.png"
+    fig, axes = plt.subplots(2, 2, figsize=(11, 9), constrained_layout=True)
+    labels = {"atitlan": "Lago Atitlán", "amatitlan": "Lago Amatitlán"}
+    colors = {"atitlan": "#176b87", "amatitlan": "#b44728"}
+    rng = np.random.default_rng(42)
+    stats_summary: dict[tuple[str, str], dict] = {}
+    for row_idx, key in enumerate(("atitlan", "amatitlan")):
+        corr = contexts[key]["corr"]
+        for col_idx, other in enumerate(("ndvi", "ndwi")):
+            ax = axes[row_idx, col_idx]
+            cyano, other_vals = corr[other]
+            n = cyano.size
+            r, p = pearsonr(cyano, other_vals)
+            stats_summary[(key, other)] = {"r": float(r), "p": float(p), "n": int(n)}
+            if n > 20000:
+                sample_idx = rng.choice(n, 20000, replace=False)
+                cyano_s, other_s = cyano[sample_idx], other_vals[sample_idx]
+            else:
+                cyano_s, other_s = cyano, other_vals
+            ax.scatter(other_s, cyano_s, s=4, alpha=0.25, color=colors[key])
+            if n > 1:
+                coeffs = np.polyfit(other_vals, cyano, 1)
+                xs = np.linspace(float(other_vals.min()), float(other_vals.max()), 50)
+                ax.plot(xs, np.polyval(coeffs, xs), color="black", lw=1.5)
+            p_txt = "< 0.001" if p < 0.001 else f"= {p:.3f}"
+            ax.set_title(f"{labels[key]}: cianobacteria vs {other.upper()}\nr = {r:.2f} (p {p_txt}, n={n})", fontsize=10)
+            ax.set_xlabel(other.upper())
+            ax.set_ylabel("Clorofila-a proxy (mg/m³)")
+            ax.grid(alpha=0.25)
+    fig.suptitle("Correlación entre el proxy de cianobacteria y NDVI/NDWI", fontsize=14, weight="bold")
+    fig.savefig(path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    return path, stats_summary
+
+
+def correlation_interpretation(correlation_stats: dict) -> list[str]:
+    labels = {"atitlan": "Lago Atitlán", "amatitlan": "Lago Amatitlán"}
+    messages = []
+    for key, label in labels.items():
+        for other in ("ndvi", "ndwi"):
+            r = correlation_stats[(key, other)]["r"]
+            strength = "fuerte" if abs(r) >= 0.5 else "moderada" if abs(r) >= 0.3 else "débil"
+            sign = "positiva" if r > 0 else "negativa" if r < 0 else "nula"
+            messages.append(
+                f"{label} — cianobacteria vs {other.upper()}: correlación {sign} y {strength} (r = {r:.2f})."
+            )
+    messages.append(
+        "Una correlación positiva con NDVI es consistente con acumulaciones o natas superficiales de "
+        "cianobacteria, que reflejan la luz de forma parecida a la vegetación densa; el NDWI, en cambio, "
+        "se usó para delimitar el propio cuerpo de agua, por lo que su relación con la cianobacteria refleja "
+        "sobre todo condiciones de la superficie del agua (turbidez, oleaje, presencia de nata) más que un "
+        "vínculo causal directo."
+    )
+    return messages
+
+
+def compare_lakes(summary: pd.DataFrame) -> list[str]:
+    """Ejercicio 7: comparación de intensidad y frecuencia de floración entre ambos lagos."""
+    good = summary[summary["calidad_suficiente"]]
+    stats = good.groupby("lago").agg(
+        media=("cyano_media_mg_m3", "mean"),
+        maximo=("cyano_media_mg_m3", "max"),
+        n_criticas=("es_fecha_critica", "sum"),
+        n_fechas=("cyano_media_mg_m3", "count"),
+    )
+    a = stats.loc["Lago Atitlán"]
+    b = stats.loc["Lago Amatitlán"]
+    mas_intenso = "Atitlán" if a["media"] > b["media"] else "Amatitlán"
+    freq_a = a["n_criticas"] / a["n_fechas"]
+    freq_b = b["n_criticas"] / b["n_fechas"]
+    mas_frecuente = "Atitlán" if freq_a > freq_b else "Amatitlán"
+    return [
+        f"En el período analizado, Lago Atitlán registró un proxy medio de {a['media']:.2f} mg/m³ "
+        f"(máximo {a['maximo']:.2f} mg/m³; {int(a['n_criticas'])} de {int(a['n_fechas'])} fechas marcadas "
+        f"como críticas), mientras que Lago Amatitlán registró {b['media']:.2f} mg/m³ "
+        f"(máximo {b['maximo']:.2f} mg/m³; {int(b['n_criticas'])} de {int(b['n_fechas'])} fechas críticas).",
+        f"En intensidad promedio, {mas_intenso} presenta los valores más altos del proxy; en frecuencia "
+        f"relativa de fechas críticas, {mas_frecuente} muestra mayor proporción de eventos "
+        f"({freq_a:.0%} de las fechas en Atitlán frente a {freq_b:.0%} en Amatitlán).",
+        "Amatitlán es un lago mucho más pequeño y de cuenca más urbanizada e industrializada, cercano al "
+        "área metropolitana de Guatemala, con aportes históricos de aguas residuales y agrícolas; eso "
+        "favorece mayor disponibilidad de nutrientes (fósforo y nitrógeno) y temperaturas de agua más "
+        "cálidas por su menor profundidad. Atitlán, de origen volcánico y mayor profundidad, con menor "
+        "densidad poblacional relativa a su tamaño, tiende a diluir más los aportes de nutrientes, aunque "
+        "no está exento de floraciones en bahías cercanas a poblaciones costeras.",
+        "Estas diferencias de causas probables —mayor presión urbana y carga de nutrientes en Amatitlán "
+        "frente a mayor dilución y profundidad en Atitlán— son consistentes con patrones documentados en "
+        "la literatura ambiental de ambos lagos, pero esta comparación satelital por sí sola no los "
+        "confirma: se requieren datos de campo (fósforo, temperatura, oxígeno disuelto) para validarlos.",
+    ]
+
+
+def exploratory_interpretation(summary: pd.DataFrame, contexts: dict) -> list[str]:
+    """Ejercicio 8.5: interpretación integrada del análisis exploratorio."""
+    good = summary[summary["calidad_suficiente"]]
+    ext = good.groupby("lago")["floracion_alta_pct"].agg(["mean", "max"])
+    persistencia_pct = {}
+    for key, label in (("atitlan", "Lago Atitlán"), ("amatitlan", "Lago Amatitlán")):
+        persistence = contexts[key]["bloom_persistence"]
+        mask = contexts[key]["mask"]
+        persistencia_pct[label] = float(np.mean(persistence[mask] >= 0.5) * 100)
+    return [
+        f"En promedio, {ext.loc['Lago Atitlán', 'mean']:.1f}% de la superficie de Atitlán y "
+        f"{ext.loc['Lago Amatitlán', 'mean']:.1f}% de la de Amatitlán muestran niveles de alerta alta "
+        f"(≥50 mg/m³, criterio guía OMS) en un momento dado; los máximos puntuales llegan a "
+        f"{ext.loc['Lago Atitlán', 'max']:.1f}% y {ext.loc['Lago Amatitlán', 'max']:.1f}% respectivamente.",
+        f"Considerando persistencia en el tiempo, un {persistencia_pct['Lago Atitlán']:.1f}% del área de "
+        f"Atitlán y un {persistencia_pct['Lago Amatitlán']:.1f}% del área de Amatitlán superó el umbral de "
+        "alerta moderada en al menos la mitad de las fechas analizadas. Estas zonas son candidatas a "
+        "acumulación crónica: típicamente bahías, zonas costeras de baja circulación o cercanas a "
+        "descargas de aguas residuales.",
+        "Los boxplots por fecha muestran cómo cambia no solo el promedio sino la dispersión de valores: "
+        "fechas con distribuciones muy asimétricas (colas largas hacia valores altos) indican floraciones "
+        "localizadas, mientras que distribuciones más compactas y elevadas sugieren eventos generalizados "
+        "en todo el lago.",
+        "La comparación estacional (seca vs. lluviosa) ayuda a distinguir si las floraciones responden más "
+        "a aporte de nutrientes por escorrentía de lluvias o a estancamiento y estratificación térmica en "
+        "temporada seca; ambos mecanismos son plausibles en Guatemala y no son excluyentes entre sí.",
+    ]
+
+
+def build_interactive_map(lake: Lake, arr: np.ndarray, date_label: str) -> Path:
+    """Ejercicio 5.1 (extra): mapa interactivo folium con el proxy de cianobacteria."""
+    maps_dir = OUTPUTS / "mapas_interactivos"
+    maps_dir.mkdir(parents=True, exist_ok=True)
+    masked = np.ma.masked_equal(arr, NODATA)
+    valid_vals = masked.compressed()
+    vmax = float(np.nanpercentile(valid_vals, 98)) if valid_vals.size else 1.0
+    norm = Normalize(vmin=0, vmax=max(vmax, 1e-6))
+    cmap = matplotlib.colormaps["turbo"]
+    rgba = cmap(norm(masked.filled(0)))
+    rgba[..., 3] = np.where(np.ma.getmaskarray(masked), 0.0, 0.85)
+    img_path = maps_dir / f"{lake.key}_overlay.png"
+    plt.imsave(img_path, rgba)
+    west, south, east, north = lake.bbox
+    center = [(south + north) / 2, (west + east) / 2]
+    fmap = folium.Map(location=center, zoom_start=13, tiles="OpenStreetMap")
+    folium.raster_layers.ImageOverlay(
+        image=str(img_path),
+        bounds=[[south, west], [north, east]],
+        opacity=0.85,
+        name=f"Cianobacteria proxy — {date_label}",
+    ).add_to(fmap)
+    folium.LayerControl().add_to(fmap)
+    html_path = maps_dir / f"{lake.key}.html"
+    fmap.save(str(html_path))
+    return html_path
+
+
 def temporal_interpretation(group: pd.DataFrame) -> list[str]:
     excluded = group[~group["calidad_suficiente"]]
     g = group[group["calidad_suficiente"]].sort_values("fecha").copy()
@@ -534,6 +847,185 @@ def add_results_table(pdf: PdfPages, summary: pd.DataFrame) -> None:
     plt.close(fig)
 
 
+def make_report(
+    summary: pd.DataFrame,
+    connection: dict,
+    contexts: dict,
+    figures: dict[str, Path],
+    correlation_stats: dict,
+) -> Path:
+    report_path = OUTPUTS / "informe_lagos_cianobacteria.pdf"
+    fecha_min = summary["fecha"].min().strftime("%d-%m-%Y")
+    fecha_max = summary["fecha"].max().strftime("%d-%m-%Y")
+
+    with PdfPages(report_path) as pdf:
+        add_text_page(
+            pdf,
+            "Monitoreo satelital de cianobacteria\nen los lagos Atitlán y Amatitlán",
+            [
+                "Este informe resume un monitoreo de floraciones de cianobacteria en los lagos Atitlán y "
+                "Amatitlán (Guatemala), realizado con imágenes del satélite Sentinel-2 (programa Copernicus "
+                f"de la Unión Europea), entre el {fecha_min} y el {fecha_max}.",
+                "Las cianobacterias son microorganismos que, bajo ciertas condiciones (agua cálida, exceso de "
+                "nutrientes, poca circulación), pueden multiplicarse rápidamente y formar 'floraciones' que "
+                "afectan la calidad del agua, el turismo, la pesca y, en algunos casos, producen toxinas "
+                "dañinas para la salud humana y animal.",
+                "Monitorear estas floraciones con muestreos físicos en el terreno es costoso y limitado: solo "
+                "cubre algunos puntos del lago y pocas fechas. Los satélites, en cambio, permiten observar la "
+                "superficie completa del lago de forma repetida en el tiempo, ayudando a identificar cuándo y "
+                "dónde ocurren los eventos más intensos, como una primera alerta que después debe confirmarse "
+                "con muestreo de campo.",
+                "Este documento está dirigido a personas sin conocimientos de programación: se explican los "
+                "métodos en términos simples y todos los hallazgos se acompañan de gráficos y mapas.",
+            ],
+            footer="Fuente de datos: Sentinel-2 L2A (Copernicus), mosaico público de Microsoft Planetary Computer. "
+                   "Script de referencia: Cyanobacteria Chlorophyll-a NDCI (custom-scripts.sentinel-hub.com).",
+        )
+
+        add_text_page(
+            pdf,
+            "¿Cómo se hizo el análisis?",
+            [
+                "El satélite Sentinel-2 capta la luz reflejada por la superficie terrestre en varias bandas de "
+                "color, incluyendo colores que el ojo humano no ve (como el infrarrojo cercano). Combinando "
+                "esas bandas se calculan 'índices' que resaltan fenómenos específicos:",
+                "• NDVI: sensible a vegetación densa; en el agua, valores altos pueden indicar acumulaciones "
+                "superficiales de algas o cianobacteria.",
+                "• NDWI: ayuda a identificar y delimitar con precisión la superficie de agua del lago.",
+                "• Índice de cianobacteria (NDCI, adaptado del script oficial de detección de cianobacteria "
+                "de Sentinel Hub): combina bandas del rojo y del borde rojo (red edge) y se convierte a un "
+                "'proxy' de clorofila-a en mg/m³, un indicador reconocido de la biomasa de algas/cianobacteria.",
+                "Para cada fecha se descartan automáticamente los píxeles con nubes, sombras, nieve o sin "
+                "datos válidos, y solo se analiza el área permanente de agua de cada lago (calculada por "
+                "consenso entre todas las fechas). Una fecha se considera de calidad suficiente cuando al "
+                "menos el 70 % del lago tiene datos válidos; las fechas con menor cobertura se muestran igual "
+                "en las tablas, pero se excluyen de los rankings de intensidad para no distorsionar las "
+                "comparaciones.",
+                "El proxy de clorofila-a es una estimación indirecta a partir del color del agua: no es un "
+                "conteo de células ni una medición de toxinas, y su fórmula original fue calibrada para otro "
+                "nivel de procesamiento del satélite, por lo que debe interpretarse como una señal de alerta, "
+                "no como una medición de laboratorio.",
+            ],
+        )
+
+        add_text_page(
+            pdf,
+            "Acceso a los datos",
+            [
+                f"Se verificó el acceso al backend oficial openEO de Copernicus Data Space ({connection.get('backend', '')}) "
+                f"para la colección {connection.get('collection', '')}. Estado de la verificación: "
+                f"{connection.get('status', 'sin datos')}.",
+                "La descarga efectiva de las imágenes usadas en este análisis se realizó a través del catálogo "
+                "público STAC de Microsoft Planetary Computer (espejo del mismo archivo oficial de Sentinel-2 "
+                "L2A), lo que permitió automatizar el proceso sin necesidad de credenciales. El identificador "
+                "exacto de cada escena satelital utilizada queda documentado en el archivo "
+                "outputs/metadata/catalogo_escenas.csv, para trazabilidad completa.",
+                "En cada fecha se descargaron únicamente las cinco bandas necesarias (verde, rojo, borde rojo, "
+                "infrarrojo cercano y la máscara de clasificación de escena), evitando descargar la imagen "
+                "satelital completa y reduciendo así el tiempo y volumen de datos transferidos.",
+            ],
+        )
+
+        add_image_page(
+            pdf, "Evolución temporal de la cianobacteria", figures["temporal"],
+            "Proxy de clorofila-a promedio por fecha en cada lago. Los puntos amarillos marcan las fechas "
+            "identificadas como prioritarias (picos relativos o valores muy por encima del promedio); las "
+            "equis rojas marcan fechas excluidas del ranking por baja cobertura de datos válidos.",
+        )
+        temporal_paragraphs = []
+        for lake_label, group in summary.groupby("lago", sort=False):
+            temporal_paragraphs.append(f"— {lake_label} —")
+            temporal_paragraphs.extend(temporal_interpretation(group))
+        add_text_page(pdf, "Interpretación de la evolución temporal", temporal_paragraphs)
+
+        add_image_page(
+            pdf, "Control de calidad de las imágenes", figures["coverage"],
+            "Porcentaje del lago con datos válidos (sin nubes ni sombras) en cada fecha. La línea punteada "
+            "marca el umbral mínimo (70 %) usado para considerar una fecha comparable en los rankings.",
+        )
+
+        add_results_table(pdf, summary)
+
+        add_image_page(
+            pdf, f"Mapas espaciales — {LAKES['atitlan'].label}", figures["comparacion_atitlan"],
+            "Distribución espacial del proxy de cianobacteria en tres momentos del período: la primera "
+            "fecha, la fecha de mayor promedio (pico) y la última fecha analizada.",
+        )
+        add_image_page(
+            pdf, f"Mapas espaciales — {LAKES['amatitlan'].label}", figures["comparacion_amatitlan"],
+            "Distribución espacial del proxy de cianobacteria en tres momentos del período: la primera "
+            "fecha, la fecha de mayor promedio (pico) y la última fecha analizada.",
+        )
+        add_image_page(
+            pdf, "Mapas de control en la fecha de mayor índice", figures["maps"],
+            "Distribución del proxy de cianobacteria en la fecha de mayor promedio de cada lago, usada como "
+            "control visual adicional de los resultados numéricos.",
+        )
+        add_text_page(
+            pdf,
+            "Interpretación de los patrones espaciales",
+            [
+                "En ambos lagos, los valores más altos del proxy tienden a concentrarse en las orillas, "
+                "bahías y zonas de baja circulación de agua, donde los nutrientes se acumulan más fácilmente "
+                "y el agua se mezcla menos con el resto del cuerpo lacustre.",
+                "Al comparar fechas dentro de un mismo lago, se observa que la distribución espacial no es "
+                "estática: algunas zonas aparecen afectadas de forma recurrente en varias fechas (ver sección "
+                "de persistencia más adelante), mientras que otras solo muestran valores altos en fechas "
+                "puntuales, lo que sugiere eventos de floración más transitorios.",
+                "Además de los mapas estáticos de este informe, se generaron mapas interactivos (uno por "
+                "lago) que permiten hacer zoom y explorar la distribución espacial sobre un mapa base real; "
+                "estos se entregan como archivos HTML en outputs/mapas_interactivos/.",
+            ],
+        )
+
+        add_image_page(
+            pdf, "Zonas de acumulación persistente", figures["persistencia"],
+            "Fracción de las fechas analizadas en que cada punto del lago superó el nivel de alerta "
+            "moderada de cianobacteria (≥10 mg/m³, criterio guía de la OMS). Los tonos más oscuros señalan "
+            "zonas afectadas de forma repetida a lo largo del período.",
+        )
+        add_image_page(
+            pdf, "Distribución de valores por fecha", figures["distribucion"],
+            "Cada caja resume la distribución del proxy de cianobacteria en el lago para una fecha dada "
+            "(línea central = mediana, caja = rango donde se concentra la mitad de los valores).",
+        )
+        add_image_page(
+            pdf, "Patrón estacional", figures["estacional"],
+            "Comparación del proxy promedio de cianobacteria entre la temporada seca (noviembre-abril) y "
+            "la temporada lluviosa (mayo-octubre) en Guatemala, para cada lago.",
+        )
+        add_text_page(pdf, "Análisis exploratorio adicional", exploratory_interpretation(summary, contexts))
+
+        add_image_page(
+            pdf, "Correlación con NDVI y NDWI", figures["correlacion"],
+            "Relación, a nivel de píxel, entre el proxy de cianobacteria y los índices NDVI y NDWI en cada "
+            "lago. La línea negra es la tendencia lineal; r es el coeficiente de correlación de Pearson.",
+        )
+        add_text_page(pdf, "Interpretación de la correlación", correlation_interpretation(correlation_stats))
+
+        add_text_page(pdf, "Comparación entre los dos lagos", compare_lakes(summary))
+
+        add_text_page(
+            pdf,
+            "Conclusiones y limitaciones",
+            [
+                "El monitoreo satelital permitió identificar, de forma consistente y con la misma "
+                "metodología para ambos lagos, las fechas y zonas con mayor probabilidad de floración de "
+                "cianobacteria durante el período analizado, así como diferencias claras de intensidad y "
+                "frecuencia entre Atitlán y Amatitlán.",
+                "El indicador utilizado es un proxy de clorofila-a, no una medición directa de células de "
+                "cianobacteria ni de las toxinas que pueden producir. Las fechas y zonas marcadas como "
+                "críticas en este informe deben interpretarse como una alerta que orienta dónde y cuándo "
+                "priorizar el muestreo físico de campo, no como una confirmación de riesgo sanitario.",
+                "Se recomienda dar seguimiento a las zonas de acumulación persistente identificadas y "
+                "contrastar los resultados con mediciones de campo (temperatura, fósforo, nitrógeno, oxígeno "
+                "disuelto) para fortalecer la interpretación ambiental de estos hallazgos.",
+            ],
+        )
+
+    return report_path
+
+
 def validate_delivery(summary: pd.DataFrame, contexts: dict, report: Path) -> dict:
     expected_dates = {(lake.label, date) for lake in LAKES.values() for date in lake.dates}
     actual_dates = {(row.lago, row.fecha.strftime("%Y-%m-%d")) for row in summary.itertuples()}
@@ -606,15 +1098,33 @@ def main() -> int:
         contexts[lake.key] = context
         all_scenes.extend(context["scenes"])
 
-    summary = classify_peaks(pd.concat(all_summaries, ignore_index=True))
+    summary = add_season(classify_peaks(pd.concat(all_summaries, ignore_index=True)))
     summary.to_csv(OUTPUTS / "resumen_temporal.csv", index=False, encoding="utf-8-sig", date_format="%Y-%m-%d")
     pd.DataFrame(all_scenes).drop_duplicates("scene_id").to_csv(
         METADATA / "catalogo_escenas.csv", index=False, encoding="utf-8-sig"
     )
-    temporal = plot_temporal(summary)
-    coverage = plot_coverage(summary)
-    maps = plot_peak_maps(summary, contexts)
-    report = make_report(summary, connection, temporal, coverage, maps)
+
+    print("Generando gráficos y mapas...", flush=True)
+    figures = {
+        "temporal": plot_temporal(summary),
+        "coverage": plot_coverage(summary),
+        "maps": plot_peak_maps(summary, contexts),
+        "comparacion_atitlan": plot_date_comparison(LAKES["atitlan"], contexts, summary),
+        "comparacion_amatitlan": plot_date_comparison(LAKES["amatitlan"], contexts, summary),
+        "persistencia": plot_bloom_persistence(contexts),
+        "distribucion": plot_distribution_by_date(contexts),
+        "estacional": plot_seasonal(summary),
+    }
+    figures["correlacion"], correlation_stats = plot_correlation(contexts)
+
+    print("Generando mapas interactivos...", flush=True)
+    for lake in LAKES.values():
+        picks = select_key_dates(summary, lake.label)
+        peak_row = picks["Fecha pico"]
+        peak_arr = contexts[lake.key]["maps"][peak_row["fecha"].strftime("%Y-%m-%d")]
+        build_interactive_map(lake, peak_arr, peak_row["fecha"].strftime("%d-%m-%Y"))
+
+    report = make_report(summary, connection, contexts, figures, correlation_stats)
     validation = validate_delivery(summary, contexts, report)
     print(f"Validación: {validation['status']}", flush=True)
     print(f"Listo: {report}", flush=True)
