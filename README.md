@@ -1,6 +1,6 @@
 # Geospatial Data
 
-Avance reproducible del análisis de cianobacteria en los lagos Atitlán y Amatitlán con Sentinel-2 L2A.
+Análisis de cianobacteria en los lagos Atitlán y Amatitlán con Sentinel-2 L2A, incluyendo preparación de datos y modelos predictivos (Machine Learning).
 
 ## Funcionalidades
 
@@ -25,6 +25,11 @@ En PowerShell:
 python -m venv .venv
 .venv\Scripts\python -m pip install -r requirements.txt
 .venv\Scripts\python main.py
+```
+
+Para procesar y preparar los datos de Machine Learning (Parte 2 del labortario):
+```powershell
+.venv\Scripts\python ml_pipeline.py
 ```
 
 Para probar además la autenticación interactiva de Copernicus:

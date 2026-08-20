@@ -6,4 +6,6 @@ pandas>=2.2,<4
 rasterio>=1.4,<2
 requests>=2.32,<3
 scipy>=1.14,<2
-
+seaborn>=0.13
+xgboost>=2.0
+scikit-learn>=1.0
