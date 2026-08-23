@@ -1,195 +1,271 @@
+"""Preparacion del conjunto de datos de Machine Learning (Laboratorio 4, Parte 2).
+
+Reutiliza los productos de la Parte I (`main.py`): la mascara permanente de cada
+lago y el cache local de bandas Sentinel-2. Construye una tabla donde cada fila
+es un pixel de agua valido en una fecha concreta, con sus bandas, indices
+espectrales y variables espaciales/temporales derivadas.
+
+El modelado (ejercicios 4-10) vive en `notebooks/laboratorio4_parte2.ipynb`;
+aqui solo se resuelve la preparacion para que el notebook no repita el trabajo
+pesado de leer 22 rasters.
+"""
+
 from __future__ import annotations
-import os
+
 from pathlib import Path
+
 import numpy as np
 import pandas as pd
-import rasterio
-import matplotlib.pyplot as plt
-import seaborn as sns
-import warnings
-warnings.filterwarnings('ignore')
+from rasterio import open as rio_open
+from rasterio.transform import xy as transform_xy
+from scipy import ndimage
+
+from main import BANDS, LAKES, NODATA, RESOLUTION, derive_indices, cache_path
 
 ROOT = Path(__file__).resolve().parents[0]
 OUTPUTS = ROOT / "outputs"
 RASTERS = OUTPUTS / "rasters"
-CACHE = ROOT / "cache"
 FIGURES = OUTPUTS / "figures"
 ML_OUTPUTS = OUTPUTS / "ml"
-LAKES = ["atitlan", "amatitlan"]
-BANDS = ("B03", "B04", "B05", "B08")
+
+DATASET_PARQUET = ML_OUTPUTS / "dataset_cianobacteria_ml.parquet"
+DATASET_CSV = ML_OUTPUTS / "dataset_cianobacteria_ml.csv.gz"
+
+# Ventana de 5x5 pixeles = 100 m x 100 m a 20 m de resolucion.
+TEXTURE_WINDOW = 5
+
+# Umbral de alta presencia de cianobacteria (mg/m3 de clorofila-a proxy).
+# Nivel de "Alert Level 2" de la OMS (Chorus & Welker, 2021).
 THRESHOLD_ALTA_PRESENCIA = 50.0
+
+# Variables que participaron, directa o indirectamente, en la construccion de
+# la respuesta y por lo tanto quedan prohibidas como predictoras:
+#   cyano_chla_proxy -> es la respuesta antes de binarizar
+#   ndci             -> unico insumo del polinomio de clorofila-a
+#   B04, B05         -> las dos bandas que forman el NDCI
+#   ndvi             -> (B08 - B04) / (B08 + B04); contiene B04
+FUGA_RESPUESTA = ("cyano_chla_proxy", "ndci", "B04", "B05", "ndvi")
+
+PREDICTORES = (
+    "B03",
+    "B08",
+    "ndwi",
+    "razon_b03_b08",
+    "b03_textura",
+    "b03_anomalia",
+    "b08_textura",
+    "dist_orilla_m",
+    "doy_sin",
+    "doy_cos",
+    "temporada_lluviosa",
+)
+
 
 def mkdirs() -> None:
     ML_OUTPUTS.mkdir(parents=True, exist_ok=True)
     FIGURES.mkdir(parents=True, exist_ok=True)
 
-def build_ml_dataset() -> pd.DataFrame:
-    """Ejercicio 1: Preparacion de los datos para Machine Learning."""
-    print("Construyendo el conjunto de datos de Machine Learning...")
-    data_rows = []
 
-    for lake in LAKES:
-        lake_raster_dir = RASTERS / lake
-        lake_cache_dir = CACHE / lake
-        
-        mask_path = lake_raster_dir / "mascara_lago.tif"
-        if not mask_path.exists():
-            continue
-            
-        with rasterio.open(mask_path) as src_mask:
-            lake_mask = src_mask.read(1)
-            transform = src_mask.transform
-            rows, cols = np.where(lake_mask == 1)
-            xs, ys = rasterio.transform.xy(transform, rows, cols)
-            
-        tif_files = list(lake_raster_dir.glob("indices_*.tif"))
-        dates = [f.stem.split('_')[1] for f in tif_files]
-        
-        for date in dates:
-            indices_path = lake_raster_dir / f"indices_{date}.tif"
-            with rasterio.open(indices_path) as src_indices:
-                cyano = src_indices.read(1)
-                ndci = src_indices.read(2)
-                ndvi = src_indices.read(3)
-                ndwi = src_indices.read(4)
-                nodata = src_indices.nodata
-                
-            cache_path = lake_cache_dir / f"{date}.npz"
-            if not cache_path.exists():
-                continue
-                
-            with np.load(cache_path) as stored:
-                b03 = stored["B03"]
-                b04 = stored["B04"]
-                b05 = stored["B05"]
-                b08 = stored["B08"]
-                
-            for i in range(len(rows)):
-                r, c = rows[i], cols[i]
-                c_val = cyano[r, c]
-                if c_val == nodata or np.isnan(c_val) or np.isinf(c_val):
-                    continue
-                    
-                data_rows.append({
-                    "x": xs[i],
-                    "y": ys[i],
-                    "fecha": date,
-                    "lago": lake,
-                    "B03": float(b03[r, c]),
-                    "B04": float(b04[r, c]),
-                    "B05": float(b05[r, c]),
-                    "B08": float(b08[r, c]),
-                    "ndvi": float(ndvi[r, c]),
-                    "ndwi": float(ndwi[r, c]),
-                    "ndci": float(ndci[r, c]),
-                    "cyano_chla_proxy": float(c_val)
-                })
+def reflectancia(dn: np.ndarray) -> np.ndarray:
+    """DN Sentinel-2 (baseline >= 04.00) a reflectancia BOA."""
+    return (dn.astype(np.float32) - 1000.0) * 0.0001
 
-    df = pd.DataFrame(data_rows)
-    df['fecha'] = pd.to_datetime(df['fecha'])
+
+def local_stats(valores: np.ndarray, valido: np.ndarray, size: int = TEXTURE_WINDOW):
+    """Media y desviacion locales ignorando los pixeles invalidos de la ventana."""
+    peso = valido.astype(np.float32)
+    x = np.where(valido, valores, 0.0).astype(np.float32)
+    n = ndimage.uniform_filter(peso, size=size, mode="constant")
+    s1 = ndimage.uniform_filter(x, size=size, mode="constant")
+    s2 = ndimage.uniform_filter(x * x, size=size, mode="constant")
+    with np.errstate(invalid="ignore", divide="ignore"):
+        media = np.where(n > 0, s1 / n, np.nan)
+        var = np.where(n > 0, s2 / n - media**2, np.nan)
+    return media, np.sqrt(np.clip(var, 0.0, None))
+
+
+def lake_context(lake_key: str) -> dict:
+    """Mascara permanente del lago, georreferencia y distancia a la orilla."""
+    with rio_open(RASTERS / lake_key / "mascara_lago.tif") as src:
+        mask = src.read(1).astype(bool)
+        transform = src.transform
+        crs = src.crs.to_string()
+
+    # distance_transform_edt mide, para cada pixel de agua, cuantos pixeles hay
+    # hasta el no-agua mas cercano. En metros: x resolucion.
+    dist_orilla = ndimage.distance_transform_edt(mask) * RESOLUTION
+
+    filas, columnas = np.nonzero(mask)
+    xs, ys = transform_xy(transform, filas, columnas)
+    return {
+        "mask": mask,
+        "transform": transform,
+        "crs": crs,
+        "dist_orilla": dist_orilla.astype(np.float32),
+        "filas": filas.astype(np.int32),
+        "columnas": columnas.astype(np.int32),
+        "x": np.asarray(xs, dtype=np.float64),
+        "y": np.asarray(ys, dtype=np.float64),
+    }
+
+
+def date_frame(lake, date: str, ctx: dict) -> pd.DataFrame:
+    """Tabla de un lago en una fecha: un renglon por pixel de agua valido."""
+    with np.load(cache_path(lake, date)) as stored:
+        arrays = {band: stored[band] for band in BANDS}
+
+    idx = derive_indices(arrays)
+    mask = ctx["mask"]
+
+    # Misma regla de validez que la Parte I: pixel dentro del lago, sin nube ni
+    # sombra, con B04 y B05 utilizables para el NDCI. Asi el conteo de filas
+    # coincide exactamente con `pixeles_validos` de outputs/resumen_temporal.csv.
+    valido = mask & idx["cyano_valid"]
+    if not valido.any():
+        return pd.DataFrame()
+
+    b03 = reflectancia(arrays["B03"])
+    b04 = reflectancia(arrays["B04"])
+    b05 = reflectancia(arrays["B05"])
+    b08 = reflectancia(arrays["B08"])
+
+    media_b03, textura_b03 = local_stats(b03, valido)
+    _, textura_b08 = local_stats(b08, valido)
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        razon = np.where(np.abs(b08) > 1e-4, b03 / b08, np.nan)
+    razon = np.clip(razon, -50.0, 50.0)
+
+    # NDVI y NDWI conservan su propia regla de validez: sobre agua muy oscura el
+    # NIR puede quedar negativo tras la correccion atmosferica, lo que invalida
+    # el cociente sin invalidar el NDCI. Esos casos entran como NaN declarado.
+    ndvi = np.where(idx["ndvi_valid"], idx["ndvi"], np.nan)
+    ndwi = np.where(idx["ndwi_valid"], idx["ndwi"], np.nan)
+
+    fecha = pd.Timestamp(date)
+    doy = fecha.day_of_year
+    n = int(valido.sum())
+
+    # Indices de los pixeles validos dentro del vector de pixeles del lago.
+    sel = valido[ctx["filas"], ctx["columnas"]]
+
+    datos = {
+        "lago": np.full(n, lake.label),
+        "fecha": np.full(n, fecha),
+        "x": ctx["x"][sel],
+        "y": ctx["y"][sel],
+        "fila": ctx["filas"][sel],
+        "columna": ctx["columnas"][sel],
+        "B03": b03[valido],
+        "B04": b04[valido],
+        "B05": b05[valido],
+        "B08": b08[valido],
+        "ndvi": ndvi[valido],
+        "ndwi": ndwi[valido],
+        "ndci": idx["ndci"][valido],
+        "cyano_chla_proxy": idx["cyano_chla"][valido],
+        "razon_b03_b08": razon[valido],
+        "b03_textura": textura_b03[valido],
+        "b03_anomalia": (b03 - media_b03)[valido],
+        "b08_textura": textura_b08[valido],
+        "dist_orilla_m": ctx["dist_orilla"][valido],
+        "mes": np.full(n, fecha.month, dtype=np.int16),
+        "doy_sin": np.full(n, np.sin(2 * np.pi * doy / 365.25), dtype=np.float32),
+        "doy_cos": np.full(n, np.cos(2 * np.pi * doy / 365.25), dtype=np.float32),
+        "temporada_lluviosa": np.full(n, int(5 <= fecha.month <= 10), dtype=np.int8),
+    }
+    return pd.DataFrame(datos)
+
+
+def build_ml_dataset(verbose: bool = True) -> pd.DataFrame:
+    """Ejercicio 1.1-1.3: conjunto de datos listo para Machine Learning."""
+    partes: list[pd.DataFrame] = []
+    for lake in LAKES.values():
+        ctx = lake_context(lake.key)
+        if verbose:
+            area = ctx["mask"].sum() * RESOLUTION**2 / 1e6
+            print(f"[{lake.label}] {ctx['mask'].sum():,} pixeles de agua ({area:.1f} km2)")
+        for date in lake.dates:
+            parte = date_frame(lake, date, ctx)
+            partes.append(parte)
+            if verbose:
+                print(f"  {date}: {len(parte):,} observaciones validas")
+
+    df = pd.concat(partes, ignore_index=True)
+    df["lago"] = df["lago"].astype("category")
+    df["alta_cianobacteria"] = (
+        df["cyano_chla_proxy"] >= THRESHOLD_ALTA_PRESENCIA
+    ).astype(np.int8)
     return df
 
-def exploratory_data_analysis(df: pd.DataFrame) -> None:
-    """Ejercicios 1.4 y 1.5: Analisis exploratorio."""
-    print("\n--- Ejercicio 1: EDA ---")
-    print(f"Total de observaciones: {len(df)}")
-    print("\nObservaciones por lago:")
-    print(df['lago'].value_counts())
-    
-    print("\nPorcentaje de valores faltantes por variable:")
-    print((df.isnull().sum() / len(df)) * 100)
-    
-    # Save statistics
-    stats = df.describe()
-    stats.to_csv(ML_OUTPUTS / "estadisticas_descriptivas.csv")
-    print(f"\nEstadisticas guardadas en {ML_OUTPUTS / 'estadisticas_descriptivas.csv'}")
 
-    cols_to_plot = ['B03', 'B04', 'B05', 'B08', 'ndvi', 'ndwi', 'cyano_chla_proxy']
-    fig, axes = plt.subplots(3, 3, figsize=(15, 12))
-    axes = axes.flatten()
+def resumen_dataset(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    """Ejercicio 1.4: conteos, tipos y porcentaje de faltantes."""
+    por_lago = df.groupby("lago", observed=True).size().rename("observaciones").to_frame()
+    por_lago["porcentaje"] = 100 * por_lago["observaciones"] / len(df)
 
-    for i, col in enumerate(cols_to_plot):
-        sns.histplot(data=df, x=col, hue="lago", bins=50, kde=True, ax=axes[i], element="step")
-        axes[i].set_title(f'Distribución de {col}')
+    por_fecha = (
+        df.groupby(["lago", "fecha"], observed=True)
+        .size()
+        .rename("observaciones")
+        .reset_index()
+    )
 
-    for j in range(len(cols_to_plot), len(axes)):
-        fig.delaxes(axes[j])
-        
-    plt.tight_layout()
-    fig.savefig(FIGURES / "eda_distribuciones_ml.png")
-    plt.close(fig)
-    print(f"Gráficos de distribución guardados en {FIGURES / 'eda_distribuciones_ml.png'}")
+    variables = pd.DataFrame(
+        {
+            "tipo": df.dtypes.astype(str),
+            "faltantes_pct": 100 * df.isna().sum() / len(df),
+            "rol": [
+                "respuesta"
+                if c == "alta_cianobacteria"
+                else "excluida (fuga)"
+                if c in FUGA_RESPUESTA
+                else "predictora"
+                if c in PREDICTORES
+                else "identificador"
+                for c in df.columns
+            ],
+        }
+    )
+    return {"por_lago": por_lago, "por_fecha": por_fecha, "variables": variables}
 
-def build_response_variable(df: pd.DataFrame) -> pd.DataFrame:
-    """Ejercicio 2: Construccion de la variable respuesta."""
-    print("\n--- Ejercicio 2: Variable Respuesta ---")
-    df['alta_cianobacteria'] = (df['cyano_chla_proxy'] >= THRESHOLD_ALTA_PRESENCIA).astype(int)
-    
-    print("Distribución global de la variable respuesta (0=Baja/Ausente, 1=Alta):")
-    print(df['alta_cianobacteria'].value_counts(normalize=True) * 100)
 
-    print("\nDistribución por lago:")
-    print(pd.crosstab(df['lago'], df['alta_cianobacteria'], normalize='index') * 100)
-    
-    print("\nDesbalance de clases detectado. El desbalance puede causar que el modelo de ML prediga siempre 0.")
-    print("Variables que no deben usarse como predictoras: cyano_chla_proxy, ndci, B04, B05 (causan data leakage).")
-
-    # Guardar gráfico de desbalance de clases
-    fig, ax = plt.subplots(figsize=(8, 6))
-    sns.countplot(data=df, x='alta_cianobacteria', hue='lago', ax=ax)
-    ax.set_title("Desbalance de Clases en Variable Respuesta")
-    fig.savefig(FIGURES / "desbalance_clases.png")
-    plt.close(fig)
-    print(f"Gráfico de desbalance guardado en {FIGURES / 'desbalance_clases.png'}")
+def cargar_dataset(reconstruir: bool = False) -> pd.DataFrame:
+    """Lee el dataset cacheado o lo reconstruye desde los rasters."""
+    if DATASET_PARQUET.exists() and not reconstruir:
+        return pd.read_parquet(DATASET_PARQUET)
+    mkdirs()
+    df = build_ml_dataset()
+    df.to_parquet(DATASET_PARQUET, index=False)
     return df
 
-def feature_engineering(df: pd.DataFrame) -> pd.DataFrame:
-    """Ejercicio 3: Selección y construcción de variables predictoras."""
-    print("\n--- Ejercicio 3: Feature Engineering ---")
-    df['mes'] = df['fecha'].dt.month
-    # Temporada (seca: nov-abr (11-12, 1-4), lluviosa: may-oct (5-10))
-    df['temporada_lluviosa'] = df['mes'].apply(lambda m: 1 if 5 <= m <= 10 else 0)
-    
-    predictores_base = ['B03', 'B08', 'ndvi', 'ndwi']
-    predictores_espaciales = ['x', 'y']
-    predictores_construidos = ['mes', 'temporada_lluviosa']
-    
-    all_predictors = predictores_base + predictores_espaciales + predictores_construidos
-    print("Predictores finales a utilizar en los modelos:")
-    for p in all_predictors:
-        print(f" - {p}")
-    return df
 
 def main() -> int:
     mkdirs()
     df = build_ml_dataset()
-    exploratory_data_analysis(df)
-    df = build_response_variable(df)
-    df = feature_engineering(df)
-    
-    out_path = ML_OUTPUTS / "dataset_cianobacteria_ml.csv"
-    df.to_csv(out_path, index=False)
-    print(f"\nDataset final guardado exitosamente en: {out_path}")
-    
-    # Escribir documento de respuestas a las justificaciones de los ejercicios
-    with open(ML_OUTPUTS / "respuestas_ejercicios_1_2_3.txt", "w", encoding="utf-8") as f:
-        f.write("=== Respuestas Ejercicios 1, 2, 3 ===\n\n")
-        f.write("1.6 Decisiones tomadas en limpieza:\n")
-        f.write("Se usó la máscara 'mascara_lago.tif' para descartar tierra. Se ignoraron pixeles con NoData o NaN.\n\n")
-        f.write("2.2 Justificación del punto de corte:\n")
-        f.write("Se usó 50 mg/m3 de acuerdo con la clasificación de alerta alta de la OMS (WHO 2021).\n\n")
-        f.write("2.4 Consecuencias de desbalance:\n")
-        f.write("El modelo puede sesgarse a predecir siempre 0, maximizando Accuracy pero ignorando floraciones. Requerirá balanceo de pesos o remuestreo.\n\n")
-        f.write("2.5 Variables excluidas:\n")
-        f.write("cyano_chla_proxy, ndci, B04, B05. Todas formaron matemáticamente la variable respuesta y causarían data leakage.\n\n")
-        f.write("3.2 Explicación de variables:\n")
-        f.write("B03 (Verde), B08 (NIR): Detectan pigmentos y natas en el agua.\n")
-        f.write("NDVI, NDWI: Reflejan presencia de biomasa fotosintética y propiedades del agua.\n")
-        f.write("x, y: Permiten capturar dependencia espacial (zonas endémicas).\n")
-        f.write("3.3 Variables adicionales:\n")
-        f.write("temporada_lluviosa: Ayuda a captar diferencias térmicas y de escorrentía estacional.\n")
-        
+
+    df.to_parquet(DATASET_PARQUET, index=False)
+    print(f"\nDataset guardado en {DATASET_PARQUET} ({len(df):,} filas)")
+
+    # Copia comprimida en texto plano para inspeccion sin pyarrow.
+    df.sample(n=min(200_000, len(df)), random_state=42).to_csv(
+        DATASET_CSV, index=False, compression="gzip"
+    )
+    print(f"Muestra de 200k filas en {DATASET_CSV}")
+
+    resumen = resumen_dataset(df)
+    for nombre, tabla in resumen.items():
+        destino = ML_OUTPUTS / f"resumen_{nombre}.csv"
+        tabla.to_csv(destino)
+        print(f"  {nombre}: {destino}")
+
+    positivos = int(df["alta_cianobacteria"].sum())
+    print(
+        f"\nRespuesta (>= {THRESHOLD_ALTA_PRESENCIA:.0f} mg/m3): "
+        f"{positivos:,} positivos = {100 * positivos / len(df):.2f}%"
+    )
     return 0
+
 
 if __name__ == "__main__":
     raise SystemExit(main())
